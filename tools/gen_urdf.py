@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Generate <description_pkg>/urdf/<vehicle>.urdf from vehicles/<vehicle>.yaml.
+
+    python3 tools/gen_urdf.py vehicles/falcon9.yaml
+
+The URDF is a build artefact: edit the YAML (or vehicle_model.py), not the URDF.
+"""
+import math
+import sys
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+import numpy as np
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vehicle_model as vm  # noqa: E402
+
+PKG = "spacex_rocket_description"
+
+
+def f(x):
+    return " ".join(f"{float(v):.6g}" for v in x)
+
+
+def inertial_xml(b):
+    I = b.I
+    return (f'    <inertial>\n      <origin xyz="{f(b.c)}" rpy="0 0 0"/>\n      <mass value="{b.m:.6g}"/>\n'
+            f'      <inertia ixx="{I[0,0]:.6g}" ixy="{I[0,1]:.6g}" ixz="{I[0,2]:.6g}" '
+            f'iyy="{I[1,1]:.6g}" iyz="{I[1,2]:.6g}" izz="{I[2,2]:.6g}"/>\n    </inertial>\n')
+
+
+def geom_xml(c):
+    if c.kind == "cylinder":
+        return f'<cylinder radius="{c.radius:.6g}" length="{c.length:.6g}"/>'
+    return f'<box size="{f(c.size)}"/>'
+
+
+class Part:
+    """One separable Gazebo model: a subtree of the vehicle cut at 'separation' joints."""
+
+    def __init__(self, name, root, links, joints, offset, plugins):
+        self.name, self.root, self.links, self.joints, self.offset, self.plugins = name, root, links, joints, offset, plugins
+
+
+def split_parts(v):
+    """booster (S1 + engines + fins + legs), upper (S2 + MVac + payload), fairing halves."""
+    children = {}
+    for j in v.joints:
+        children.setdefault(j.parent, []).append(j)
+
+    def subtree(root, stop=()):
+        links, joints, stack = [root], [], [root]
+        while stack:
+            for j in children.get(stack.pop(), []):
+                if j.name in stop:
+                    continue
+                joints.append(j)
+                links.append(j.child)
+                stack.append(j.child)
+        return links, joints
+
+    def offset(link):
+        z = 0.0
+        while link != "base_link":
+            j = next(j for j in v.joints if j.child == link)
+            z += j.xyz[2]
+            link = j.parent
+        return z
+
+    seps = [j for j in v.joints if j.role == "separation" and j.name != "payload_separation"]
+    stop = {j.name for j in seps}
+    parts = []
+    bl, bj = subtree("base_link", stop)
+    parts.append(Part(v.name, "base_link", bl, bj, 0.0, "booster"))
+    ul, uj = subtree("s2_body", stop)
+    parts.append(Part(f"{v.name}_upper", "s2_body", ul, uj, offset("s2_body"), "upper"))
+    for j in seps:
+        if j.child.startswith("fairing"):
+            fl, fj = subtree(j.child, stop)
+            parts.append(Part(f"{v.name}_{j.child}", j.child, fl, fj, offset(j.child), "none"))
+    return parts
+
+
+def links_joints_xml(v, part):
+    out = []
+    for l in (l for l in v.links if l.name in part.links):
+        out.append(f'  <link name="{l.name}">\n')
+        if l.inertial:
+            out.append(inertial_xml(l.inertial))
+        if l.mesh:
+            out.append(f'    <visual>\n      <origin xyz="0 0 0" rpy="{f(l.mesh_rpy)}"/>\n      <geometry>\n'
+                       f'        <mesh filename="package://{PKG}/meshes/{v.name}/{l.mesh}"/>\n'
+                       f'      </geometry>\n    </visual>\n')
+        for c in l.collisions:
+            out.append(f'    <collision>\n      <origin xyz="{f(c.xyz)}" rpy="{f(c.rpy)}"/>\n'
+                       f'      <geometry>{geom_xml(c)}</geometry>\n    </collision>\n')
+        out.append('  </link>\n')
+    for j in part.joints:
+        out.append(f'  <joint name="{j.name}" type="{j.type}">\n    <parent link="{j.parent}"/>\n'
+                   f'    <child link="{j.child}"/>\n    <origin xyz="{f(j.xyz)}" rpy="{f(j.rpy)}"/>\n')
+        if j.type == "revolute":
+            out.append(f'    <axis xyz="{f(j.axis)}"/>\n    <limit lower="{j.lower:.6g}" upper="{j.upper:.6g}" '
+                       f'effort="{j.effort:.6g}" velocity="{j.velocity:.6g}"/>\n'
+                       f'    <dynamics damping="{0.0}" friction="0"/>\n')
+        out.append('  </joint>\n')
+        if j.preserve:
+            out.append(f'  <gazebo reference="{j.name}">\n    <preserveFixedJoint>true</preserveFixedJoint>\n'
+                       f'  </gazebo>\n')
+    return "".join(out)
+
+
+def detach_xml(parent_link, child_model, child_link, topic):
+    return (f'    <plugin filename="gz-sim-detachable-joint-system" name="gz::sim::systems::DetachableJoint">\n'
+            f'      <parent_link>{parent_link}</parent_link>\n      <child_model>{child_model}</child_model>\n'
+            f'      <child_link>{child_link}</child_link>\n      <detach_topic>{topic}</detach_topic>\n'
+            f'      <suppress_child_warning>true</suppress_child_warning>\n    </plugin>\n')
+
+
+def generate_part(v, part, parts):
+    sep_s2, sep_fair = f"/{v.name}/separation/s1_s2", f"/{v.name}/separation/fairing"
+    out = [f'<?xml version="1.0"?>\n<!-- GENERATED by tools/gen_urdf.py from vehicles/{v.name}.yaml. Do not edit. -->\n',
+           f'<robot name="{part.name}">\n', links_joints_xml(v, part)]
+    if part.plugins == "none":
+        out.append('</robot>\n')
+        return "".join(out)
+    out.append(effects_xml(v, part))
+    out.append('  <gazebo>\n    <plugin filename="gz-sim-joint-state-publisher-system" '
+               'name="gz::sim::systems::JointStatePublisher"/>\n')
+    out.append(servos_xml(v, part))
+    if part.plugins == "booster":
+        out.append(detach_xml("base_link", f"{v.name}_upper", "s2_body", sep_s2))
+        out.append(aero_xml(v, sep_s2))
+        out.append(sensors_xml(v))
+        attached = [(f"{v.name}_upper", sep_s2)] + [(p.name, sep_fair) for p in parts if p.plugins == "none"]
+        out.append(propulsion_xml(v, part, ["s1"], attached=attached, rcs=True, pad_fx=True))
+    else:   # upper stage: passive (carried by the booster's emulation) until stage separation
+        for p in parts:
+            if p.plugins == "none":
+                out.append(detach_xml("s2_body", p.name, p.root, sep_fair))
+        attached = [(p.name, sep_fair) for p in parts if p.plugins == "none"]
+        out.append(propulsion_xml(v, part, ["s2"], attached=attached, passive_until=sep_s2))
+    out.append('  </gazebo>\n</robot>\n')
+    return "".join(out)
+
+
+# actuator bandwidth [rad/s] and slew-rate limit [rad/s] per joint role (estimates; see docs)
+SERVO_PARAMS = {"gimbal": (40.0, 0.35), "fin_steer": (20.0, 2.0), "fin_deploy": (10.0, 0.6),
+                "leg_deploy": (6.0, 0.5)}
+
+
+def servos_xml(v, part):
+    out = ['    <plugin filename="ActuatorServos" name="rocket_propulsion::ActuatorServos">\n']
+    for j in part.joints:
+        if j.type != "revolute":
+            continue
+        bw, rate = SERVO_PARAMS[j.role]
+        lock = ' lock_bandwidth="60.0"' if j.role == "leg_deploy" else ""     # legs latch when deployed
+        out.append(f'      <servo joint="{j.name}" topic="/{v.name}/{j.name}/cmd_pos" bandwidth="{bw}" zeta="0.9" '
+                   f'rate_limit="{rate}" effort="{j.effort:.6g}"{lock}/>\n')
+    out.append('    </plugin>\n')
+    return "".join(out)
+
+
+TEX = "model://spacex_rocket_description/materials/textures"
+
+
+def emitter(name, pose, size, psize, life, rate, vmin, vmax, scale, ramp, topic, etype="cylinder", sprite="puff.png",
+            glow=False):
+    return (f'    <particle_emitter name="{name}" type="{etype}">\n'
+            f'      <emitting>false</emitting>\n      <pose>{pose}</pose>\n      <size>{size}</size>\n'
+            f'      <particle_size>{psize} {psize} {psize}</particle_size>\n      <lifetime>{life}</lifetime>\n'
+            f'      <rate>{rate}</rate>\n      <min_velocity>{vmin}</min_velocity><max_velocity>{vmax}</max_velocity>\n'
+            f'      <scale_rate>{scale}</scale_rate>\n'
+            f'      <color_range_image>{TEX}/{ramp}</color_range_image>\n'
+            f'      <material><diffuse>1 1 1 1</diffuse><specular>0 0 0 1</specular>'
+            + ('<emissive>1 1 1 1</emissive><lighting>false</lighting>' if glow else '') +
+            f'<pbr><metal><albedo_map>{TEX}/{sprite}</albedo_map></metal></pbr></material>\n'
+            f'      <topic>{topic}</topic>\n    </particle_emitter>\n')
+
+
+def effects_xml(v, part):
+    """Exhaust visuals as particle emitters, switched/scaled at runtime by RocketPropulsion.
+    Emitters fire along their +x axis; pitch +90 deg points that down the engine axis."""
+    out = []
+    for j in part.joints:
+        if j.role == "gimbal" and j.name.endswith("_gimbal_yaw"):
+            eng = j.child
+            em = v.spec["engine_models"][next(st for st in v.spec["stages"]
+                                              if eng.startswith(st["name"] + "_engine"))["engines"]["model"]]
+            L = em["length"]
+            out.append(f'  <gazebo reference="{eng}">\n')
+            out.append(emitter(f"{eng}_flame", f"0 0 {-L - 0.05:.3f} 0 1.5708 0", "0.2 0.7 0.7", 0.9, 0.35, 0, 30, 45,
+                               4, "flame_ramp.png", f"/{v.name}/effects/{eng}_flame", sprite="flame_puff.png",
+                               glow=True))
+            out.append('  </gazebo>\n')
+    if part.root != "base_link":
+        return "".join(out)
+    out.append('  <gazebo reference="base_link">\n')
+    out.append(emitter("smoke_trail", "0 0 -3.5 0 1.5708 0", "1.0 3.0 3.0", 5.0, 7.0, 0, 6, 14, 2.5,
+                       "smoke_ramp.png", f"/{v.name}/effects/smoke_trail", sprite="smoke_puff.png"))
+    out.append('  </gazebo>\n')
+    return "".join(out)
+
+
+def odometry_xml(v):
+    return (f'    <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">\n'
+            f'      <odom_frame>world</odom_frame><robot_base_frame>base_link</robot_base_frame>\n'
+            f'      <odom_publish_frequency>100</odom_publish_frequency><dimensions>3</dimensions>\n'
+            f'      <odom_topic>/{v.name}/odometry</odom_topic>\n    </plugin>\n')
+
+
+def sensors_xml(v):
+    """rocket_sensors::VehicleSensors parameters from the vehicle's avionics block."""
+    a = v.spec.get("avionics")
+    if not a:
+        return ""
+    i, g, al, pg, th = a["imu"], a["gnss"], a["alignment"], a["propellant_gauge"], a["thrust_sensor"]
+    p = dict(prefix=f"/{v.name}/sensors", telemetry_prefix=f"/{v.name}/telemetry",
+             imu_position=" ".join(map(str, i["position"])), gnss_antenna=" ".join(map(str, g["antenna"])),
+             imu_rate_hz=i["rate_hz"], gnss_rate_hz=g["rate_hz"], gyro_bias_turn_on_deg_h=i["gyro_bias_turn_on_deg_h"],
+             gyro_bias_rw_deg_h_rt_h=i["gyro_bias_rw_deg_h_rt_h"], gyro_arw_deg_rt_h=i["gyro_arw_deg_rt_h"],
+             gyro_scale_factor_ppm=i["gyro_scale_factor_ppm"], accel_bias_turn_on_ug=i["accel_bias_turn_on_ug"],
+             accel_bias_rw_ug_rt_h=i["accel_bias_rw_ug_rt_h"], accel_vrw_m_s_rt_h=i["accel_vrw_m_s_rt_h"],
+             accel_scale_factor_ppm=i["accel_scale_factor_ppm"], gnss_pos_white_m=g["pos_white_m"],
+             gnss_pos_gm_m=g["pos_gm_m"], gnss_pos_gm_tau_s=g["pos_gm_tau_s"], gnss_vel_white_m_s=g["vel_white_m_s"],
+             align_tilt_sigma_deg=al["tilt_sigma_deg"], align_heading_sigma_deg=al["heading_sigma_deg"],
+             gauge_bias_frac=pg["bias_frac"], gauge_noise_frac=pg["noise_frac"], thrust_noise_frac=th["noise_frac"],
+             s1_propellant_full=v.spec["stages"][0]["propellant_mass"], seed=1)
+    body = "".join(f"      <{k}>{val}</{k}>\n" for k, val in p.items())
+    return f'    <plugin filename="VehicleSensors" name="rocket_sensors::VehicleSensors">\n{body}    </plugin>\n'
+
+
+def aero_xml(v, switch_topic):
+    A, Bd = v.spec["aero"], v.spec["aero_booster"]
+    cd = lambda t: " ".join(f"{m:g}:{c:g}" for m, c in t)  # noqa: E731
+    G = v.spec["stages"][0]["grid_fins"]
+    fins = " ".join(f"grid_fin_{k + 1}" for k in range(G["count"]))
+    return (f'    <plugin filename="RocketAero" name="rocket_aero::RocketAero">\n'
+            f'      <link>base_link</link>\n      <reference_area>{A["reference_area"]}</reference_area>\n'
+            f'      <cp_z>{A["cp_z"]}</cp_z>\n      <cn_alpha>{A["cn_alpha"]}</cn_alpha>\n'
+            f'      <cd_mach>{cd(A["cd_mach"])}</cd_mach>\n'
+            f'      <after_topic>{switch_topic}</after_topic>\n'
+            f'      <after_reference_area>{Bd["reference_area"]}</after_reference_area>\n'
+            f'      <after_cp_z>{Bd["cp_z"]}</after_cp_z>\n      <after_cn_alpha>{Bd["cn_alpha"]}</after_cn_alpha>\n'
+            f'      <after_cd_mach>{cd(Bd["cd_mach"])}</after_cd_mach>\n'
+            f'      <grid_fins names="{fins}" area="{G["width"] * G["length"]:.3f}" cn_delta="{Bd["fin_cn_delta"]}" '
+            f'cd0="{Bd["fin_cd0"]}" radius="{v.spec["stages"][0]["radius"] + G["radial_offset"] + G["length"] / 2:.3f}" '
+            f'z="{G["hinge_z"]}" deploy_deg="{G["deploy_deg"]}"/>\n'
+            f'    </plugin>\n')
+
+
+def propulsion_xml(v, part, stages, attached=(), passive_until=None, rcs=False, pad_fx=False):
+    """Engine/tank config for rocket_propulsion::RocketPropulsion, derived from the YAML."""
+    s = v.spec
+    dens = s["propellant_densities"]
+    pads = "/launch_pad/effects/trench /launch_pad/effects/deck_n /launch_pad/effects/deck_s" if pad_fx else ""
+    out = [f'    <plugin filename="RocketPropulsion" name="rocket_propulsion::RocketPropulsion">\n',
+           f'      <telemetry_prefix>/{part.name}/telemetry</telemetry_prefix>\n',
+           f'      <nav_topic>/{part.name}/nav</nav_topic>\n',
+           f'      <effects prefix="/{v.name}/effects/" pad_topics="{pads}"/>\n']
+    for name, topic in attached:
+        out.append(f'      <attached_model name="{name}" detach_topic="{topic}"/>\n')
+    if passive_until:
+        out.append(f'      <passive_until_topic>{passive_until}</passive_until_topic>\n'
+                   f'      <separation_push force="{v.spec["separation"]["push_force"]}" '
+                   f'duration="{v.spec["separation"]["push_duration"]}"/>\n')
+    if rcs:
+        R = s["stages"][0]["rcs"]
+        out.append(f'      <rcs torque_topic="/{v.name}/rcs/torque" max_torque="{" ".join(map(str, R["max_torque"]))}"/>\n')
+    for st in (st for st in s["stages"] if st["name"] in stages):
+        link = "base_link" if st["name"] == "s1" else f"{st['name']}_body"    # s1_body is lumped into base_link
+        mp, mr = st["propellant_mass"], st["mixture_ratio"]
+        out.append(f'      <stage name="{st["name"]}" link="{link}" throttle_topic="/{v.name}/{st["name"]}/throttle" '
+                   f'engines_topic="/{v.name}/{st["name"]}/engines">\n')
+        for tank, m, rho in (("lox_tank", mp * mr / (1 + mr), dens["lox"]), ("rp1_tank", mp / (1 + mr), dens["rp1"])):
+            z0, z1 = st["sections"][tank]
+            # same radius as vehicle_model._propellant_columns (stage radius - 0.02)
+            out.append(f'        <tank name="{tank}" mass="{m:.3f}" density="{rho}" radius="{st["radius"] - 0.02:.4f}" '
+                       f'z0="{z0}" z1="{z1}"/>\n')
+        em = s["engine_models"][st["engines"]["model"]]
+        if em["thrust_sl"] > 0:   # exit area reproduces both published SL and vacuum thrust
+            area = (em["thrust_vac"] - em["thrust_sl"]) / 101325.0
+        else:
+            area = math.pi * em["exit_radius"] ** 2
+        for j in v.joints:
+            if j.role == "gimbal" and j.name.endswith("_gimbal_yaw") and j.child.startswith(st["name"] + "_engine"):
+                out.append(f'        <engine link="{j.child}" thrust_vac="{em["thrust_vac"]:.1f}" isp_vac="{em["isp_vac"]}" '
+                           f'exit_area="{area:.5f}" throttle_min="{em["throttle_min"]}"/>\n')
+        out.append('      </stage>\n')
+    out.append('    </plugin>\n')
+    return "".join(out)
+
+
+def main():
+    spec = Path(sys.argv[1]).resolve()
+    v = vm.build(spec)
+    parts = split_parts(v)
+    urdf_dir = spec.parent.parent / "urdf"
+    assembly = {"vehicle": v.name, "models": []}
+    for p in parts:
+        dest = urdf_dir / f"{p.name}.urdf"
+        dest.write_text(generate_part(v, p, parts))
+        m = sum(l.inertial.m for l in v.links if l.name in p.links and l.inertial)
+        assembly["models"].append({"name": p.name, "urdf": f"{p.name}.urdf", "z_offset": p.offset, "mass": round(m, 1)})
+        print(f"wrote {dest}  ({len(p.links)} links, {len(p.joints)} joints, {m:.0f} kg, z offset {p.offset} m)")
+    (urdf_dir / f"{v.name}_assembly.yaml").write_text(yaml.safe_dump(assembly, sort_keys=False))
+    write_mass_table(v, spec.parent / f"{v.name}_massprops.csv")
+    write_mass_table(v, spec.parent / f"{v.name}_booster_massprops.csv",
+                     links=next(p for p in parts if p.plugins == "booster").links)
+    up_links = next(p for p in parts if p.plugins == "upper").links
+    write_mass_table(v, spec.parent / f"{v.name}_upper_massprops.csv", links=up_links, stage=1)
+
+
+def write_mass_table(v, dest, n=61, links=None, stage=0):
+    """Mass properties vs a stage's propellant (joints at 0, vehicle frame) for GNC gain scheduling: whole
+    stack, or only the given links (booster / upper stage after separation)."""
+    st = v.spec["stages"][stage]
+    rows = [f"{st['name']}_prop_kg,mass_kg,com_z_m,ixx,iyy,izz"]
+    for p in np.linspace(st["propellant_mass"], 0.0, n):
+        B = vm.mass_properties_at(v, {st["name"]: p}, links=links)
+        rows.append(f"{p:.1f},{B.m:.1f},{B.c[2]:.4f},{B.I[0, 0]:.6e},{B.I[1, 1]:.6e},{B.I[2, 2]:.6e}")
+    dest.write_text("\n".join(rows) + "\n")
+    print(f"wrote {dest}")
+
+
+if __name__ == "__main__":
+    main()

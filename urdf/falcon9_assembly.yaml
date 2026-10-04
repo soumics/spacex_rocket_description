@@ -1,0 +1,18 @@
+vehicle: falcon9
+models:
+- name: falcon9
+  urdf: falcon9.urdf
+  z_offset: 0.0
+  mass: 421300.0
+- name: falcon9_upper
+  urdf: falcon9_upper.urdf
+  z_offset: 44.0
+  mass: 100630.5
+- name: falcon9_fairing_a
+  urdf: falcon9_fairing_a.urdf
+  z_offset: 55.7
+  mass: 950.0
+- name: falcon9_fairing_b
+  urdf: falcon9_fairing_b.urdf
+  z_offset: 55.7
+  mass: 950.0
